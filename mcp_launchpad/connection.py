@@ -224,7 +224,7 @@ class ConnectionManager:
         )
 
         try:
-            async with asyncio.timeout(CONNECTION_TIMEOUT):
+            async with asyncio.timeout(CONNECTION_TIMEOUT) as setup_timeout:
                 # Preflight check: detect OAuth-requiring servers before full connection
                 # MCP servers requiring OAuth return 401 with WWW-Authenticate header
                 try:
@@ -260,6 +260,8 @@ class ConnectionManager:
                 ) as (read, write, _get_session_id):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
+                        # Timeout only applies to connection setup, not to tool calls
+                        setup_timeout.reschedule(None)
                         logger.debug(f"HTTP connection to '{server_name}' initialized")
                         yield session
                         logger.debug(f"HTTP connection to '{server_name}' closing")
@@ -331,13 +333,15 @@ class ConnectionManager:
             # Cast to TextIO for type checker - NamedTemporaryFile in text mode is compatible
             stderr_file = cast(TextIO, stderr_tmp)
             try:
-                async with asyncio.timeout(CONNECTION_TIMEOUT):
+                async with asyncio.timeout(CONNECTION_TIMEOUT) as setup_timeout:
                     async with stdio_client(server_params, errlog=stderr_file) as (
                         read,
                         write,
                     ):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
+                            # Timeout only applies to server startup, not to tool calls
+                            setup_timeout.reschedule(None)
                             logger.debug(f"Stdio connection to '{server_name}' initialized")
                             yield session
                             logger.debug(f"Stdio connection to '{server_name}' closing")
@@ -401,7 +405,7 @@ class ConnectionManager:
             )
 
         try:
-            async with asyncio.timeout(CONNECTION_TIMEOUT):
+            async with asyncio.timeout(CONNECTION_TIMEOUT) as setup_timeout:
                 async with sse_client(
                     url,
                     headers=headers,
@@ -410,6 +414,8 @@ class ConnectionManager:
                 ) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
+                        # Timeout only applies to connection setup, not to tool calls
+                        setup_timeout.reschedule(None)
                         logger.debug(f"SSE connection to '{server_name}' initialized")
                         yield session
                         logger.debug(f"SSE connection to '{server_name}' closing")

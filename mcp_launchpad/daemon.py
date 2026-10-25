@@ -222,7 +222,7 @@ class Daemon:
             server_state.http_client = http_client
 
             try:
-                async with asyncio.timeout(CONNECTION_TIMEOUT):
+                async with asyncio.timeout(CONNECTION_TIMEOUT) as setup_timeout:
                     # Preflight check: detect OAuth-requiring servers
                     # MCP servers requiring OAuth return 401 with WWW-Authenticate
                     try:
@@ -255,6 +255,9 @@ class Daemon:
                     ) as (read, write, _get_session_id):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
+                            # Timeout only applies to connection setup - disable it so it
+                            # doesn't tear down the connection during the keep-alive loop
+                            setup_timeout.reschedule(None)
 
                             server_state.session = session
                             server_state.connected = True
@@ -361,7 +364,7 @@ class Daemon:
                 server_state.error = None
 
             try:
-                async with asyncio.timeout(CONNECTION_TIMEOUT):
+                async with asyncio.timeout(CONNECTION_TIMEOUT) as setup_timeout:
                     async with sse_client(
                         url,
                         headers=headers,
@@ -370,6 +373,9 @@ class Daemon:
                     ) as (read, write):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
+                            # Timeout only applies to connection setup - disable it so it
+                            # doesn't tear down the connection during the keep-alive loop
+                            setup_timeout.reschedule(None)
 
                             server_state.session = session
                             server_state.connected = True

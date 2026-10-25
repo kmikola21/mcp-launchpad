@@ -1,7 +1,9 @@
 """Tests for session daemon."""
 
+import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -946,3 +948,106 @@ class TestDaemonConfigReload:
 
         assert "server-b" in daemon.state.config.servers
         assert daemon.state.config_mtime == fixed_mtime
+
+
+class _FakeSession:
+    """Stand-in for mcp.ClientSession with a configurable initialize()."""
+
+    init_delay = 0.0
+
+    def __init__(self, read, write):
+        pass
+
+    async def initialize(self):
+        await asyncio.sleep(self.init_delay)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+@asynccontextmanager
+async def _fake_http_transport(*args, **kwargs):
+    yield MagicMock(), MagicMock(), MagicMock()
+
+
+@asynccontextmanager
+async def _fake_sse_transport(*args, **kwargs):
+    yield MagicMock(), MagicMock()
+
+
+class TestDaemonConnectionTimeoutScope:
+    """CONNECTION_TIMEOUT must only bound connection setup, not the connection's lifetime.
+
+    Regression: the timeout used to wrap the keep-alive loop of HTTP and SSE servers, so the
+    daemon tore every such connection down CONNECTION_TIMEOUT seconds after connecting. Calls
+    landing in the reconnect window failed with a stale "Connection timed out" error, and calls
+    in flight at the cut never returned.
+    """
+
+    @pytest.fixture(params=["http", "sse"])
+    def remote_server(self, request):
+        server_type = request.param
+        config = Config(
+            servers={
+                "remote": ServerConfig(
+                    name="remote",
+                    server_type=server_type,
+                    url="https://example.com/mcp",
+                    headers={},
+                ),
+            },
+            config_path=Path("/tmp/test-config.json"),
+        )
+        transport = _fake_http_transport if server_type == "http" else _fake_sse_transport
+        target = (
+            "mcp_launchpad.daemon.streamable_http_client"
+            if server_type == "http"
+            else "mcp_launchpad.daemon.sse_client"
+        )
+        return config, target, transport
+
+    @asynccontextmanager
+    async def _patched(self, target, transport, init_delay=0.0):
+        preflight = MagicMock(status_code=200)
+        session_cls = type("Session", (_FakeSession,), {"init_delay": init_delay})
+        with (
+            patch("mcp_launchpad.daemon.get_parent_pid", return_value=12345),
+            patch("mcp_launchpad.daemon.CONNECTION_TIMEOUT", 0.2),
+            patch("mcp_launchpad.daemon.MAX_RECONNECT_ATTEMPTS", 1),
+            patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=preflight)),
+            patch(target, transport),
+            patch("mcp_launchpad.daemon.ClientSession", session_cls),
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_connection_survives_past_connection_timeout(self, remote_server):
+        config, target, transport = remote_server
+        async with self._patched(target, transport):
+            daemon = Daemon(config)
+            daemon.state.running = True
+            task = asyncio.create_task(daemon._connect_server("remote"))
+            try:
+                await asyncio.sleep(0.6)  # 3x CONNECTION_TIMEOUT
+
+                server_state = daemon.state.servers["remote"]
+                assert server_state.error is None
+                assert server_state.connected is True
+            finally:
+                daemon.state.running = False
+                await asyncio.wait_for(task, timeout=3)
+
+    @pytest.mark.asyncio
+    async def test_slow_initialization_still_times_out(self, remote_server):
+        config, target, transport = remote_server
+        async with self._patched(target, transport, init_delay=10):
+            daemon = Daemon(config)
+            daemon.state.running = True
+            await asyncio.wait_for(daemon._connect_server("remote"), timeout=3)
+
+        server_state = daemon.state.servers["remote"]
+        assert server_state.connected is False
+        assert "timed out" in server_state.error.lower()
